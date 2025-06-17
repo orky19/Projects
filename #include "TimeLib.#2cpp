@@ -1,0 +1,284 @@
+#include "TimeLib.h"
+#include "SdFat.h"
+#include <IntervalTimer.h>
+#include "qCommand.h"
+#include "SmartData.h"
+#include "ADC.h"
+#include "DAC.h"
+#include <math.h>
+
+qCommand qC;
+void startADC(int channel, int range, void (*isr)(), float sampleRate);
+
+// --- Per-channel filter and PID state ---
+struct BiquadState {
+    float a0, a1, a2, b1, b2;
+    float x1, x2, y1, y2;
+};
+struct PIDState {
+    float integral;
+    float prev_input;
+};
+
+BiquadState biquad[4];
+PIDState pid[4];
+volatile unsigned long adc_isr_duration[4] = {0, 0, 0, 0}; // ISR durations in microseconds
+
+// --- Per-channel parameters (SmartData for runtime tuning) ---
+SmartData<float> cutoffHz[4]      = {100.0, 100.0, 100.0, 100.0};
+SmartData<float> sampleRate[4]    = {10000.0, 10000.0, 10000.0, 10000.0};
+SmartData<float> setpoint[4]      = {0.0, 0.0, 0.0, 0.0};
+SmartData<float> Kp[4]            = {1.975f, 1.975f, 1.975f, 1.975f};
+SmartData<float> Ki[4]            = {0.01f, 0.01f, 0.01f, 0.01f};
+SmartData<float> Kd[4]            = {0.00001f, 0.00001f, 0.00001f, 0.00001f};
+SmartData<float> FastGain[4]      = {5.0f, 5.0f, 5.0f, 5.0f};
+SmartData<bool>  pidEnabled[4]    = {true, true, true, true};
+SmartData<bool>  invertOutput[4]  = {false, false, false, false};
+
+// --- SmartData for monitoring (optional) ---
+SmartData<float> adc_voltage[4]   = {0, 0, 0, 0};
+SmartData<float> filtered[4]      = {0, 0, 0, 0};
+SmartData<float> fast_error[4]    = {0, 0, 0, 0};
+SmartData<float> fast_output[4]   = {0, 0, 0, 0};
+SmartData<float> pid_error[4]     = {0, 0, 0, 0};
+SmartData<float> pid_integral_sd[4] = {0, 0, 0, 0};
+SmartData<float> pid_derivative[4] = {0, 0, 0, 0};
+SmartData<float> pid_output[4]    = {0, 0, 0, 0};
+SmartData<float> final_output[4]  = {0, 0, 0, 0};
+
+// --- Helper: Calculate filter coefficients for each channel ---
+void calcBiquadLPF(int ch, float fc, float fs) {
+    float omega = 2.0 * M_PI * fc / fs;
+    float cos_omega = cos(omega);
+    float sin_omega = sin(omega);
+    float alpha = sin_omega / (2.0 * sqrt(2.0));
+
+    float b0 = (1.0 - cos_omega) / 2.0;
+    float b1_ = 1.0 - cos_omega;
+    float b2_ = (1.0 - cos_omega) / 2.0;
+    float a0_ = 1.0 + alpha;
+    float a1_ = -2.0 * cos_omega;
+    float a2_ = 1.0 - alpha;
+
+    biquad[ch].a0 = b0 / a0_;
+    biquad[ch].a1 = b1_ / a0_;
+    biquad[ch].a2 = b2_ / a0_;
+    biquad[ch].b1 = a1_ / a0_;
+    biquad[ch].b2 = a2_ / a0_;
+    biquad[ch].x1 = biquad[ch].x2 = biquad[ch].y1 = biquad[ch].y2 = 0.0f;
+}
+
+// --- Low pass filter for each channel ---
+float lowPassFilter(int ch, float input) {
+    BiquadState &bq = biquad[ch];
+    float y = bq.a0 * input + bq.a1 * bq.x1 + bq.a2 * bq.x2 - bq.b1 * bq.y1 - bq.b2 * bq.y2;
+    bq.x2 = bq.x1;
+    bq.x1 = input;
+    bq.y2 = bq.y1;
+    bq.y1 = y;
+    return y;
+}
+
+// --- Clamp to ±10V ---
+float clamp10V(float v) {
+    if (v > 10.0f) return 10.0f;
+    if (v < -10.0f) return -10.0f;
+    return v;
+}
+
+// --- Centralized DAC output for qNimble Quarto ---
+// Note: channel is 1-based (1=CH1, 2=CH2, 3=CH3, 4=CH4)
+void writeDAC(int channel, float voltage) {
+    voltage = clamp10V(voltage);
+    int16_t code = (int16_t)((voltage / 10.0f) * 32768.0f);
+    switch (channel) {
+        case 1: writeDACRAW(1, code); break;
+        case 2: writeDACRAW(2, code); break;
+        case 3: writeDACRAW(3, code); break;
+        case 4: writeDACRAW(4, code); break;
+        default:
+            Serial.print("Invalid DAC channel: ");
+            Serial.println(channel);
+            break;
+    }
+}
+
+void DAC1_write(float voltage) { writeDAC(1, voltage); }
+void DAC2_write(float voltage) { writeDAC(2, voltage); }
+void DAC3_write(float voltage) { writeDAC(3, voltage); }
+void DAC4_write(float voltage) { writeDAC(4, voltage); }
+
+// --- ADC ISR handler wrappers (use QNimble core's functions) ---
+extern "C" double readADC1_from_ISR(void);
+extern "C" double readADC2_from_ISR(void);
+extern "C" double readADC3_from_ISR(void);
+extern "C" double readADC4_from_ISR(void);
+
+// --- Main per-channel processing function ---
+void processADCtoDAC(int ch, double adcValue, void (*dacWrite)(float)) {
+    if (ch < 0 || ch >= 4) {
+        Serial.print("Invalid ADC channel: ");
+        Serial.println(ch);
+        return;
+    }
+
+    // 1. Convert raw ADC to voltage (±10V)
+    float voltage = (float(adcValue) / 32768.0f) * 10.0f;
+    adc_voltage[ch].set(voltage);
+
+    // 2. Low-Pass Filter (Biquad)
+    float filt = lowPassFilter(ch, voltage);
+    filtered[ch].set(filt);
+
+    // 3. Fast Controller (P only)
+    float ferr = setpoint[ch].get() - filt;
+    fast_error[ch].set(ferr);
+    float fout = ferr * FastGain[ch].get();
+    fast_output[ch].set(fout);
+
+    float output = 0.0f;
+    float finalOut = 0.0f;
+
+    // 4. Optional PID Control
+if (pidEnabled[ch].get()) {
+    float pid_input = fout;
+    float error = pid_input;
+    // Integrate error (I term)
+    pid[ch].integral += error * (1.0f / sampleRate[ch].get());
+    // Clamp integral to prevent windup
+    if (pid[ch].integral > 100.0f) pid[ch].integral = 100.0f;
+    if (pid[ch].integral < -100.0f) pid[ch].integral = -100.0f;
+    // Derivative (D term)
+    float derivative = (pid_input - pid[ch].prev_input) * sampleRate[ch].get();
+    // PID output
+    output = (Kp[ch].get() * error) + (Ki[ch].get() * pid[ch].integral) + (Kd[ch].get() * derivative);
+    pid[ch].prev_input = pid_input;
+    // Store for monitoring
+    pid_error[ch].set(error);
+    pid_integral_sd[ch].set(pid[ch].integral);
+    pid_derivative[ch].set(derivative);
+    pid_output[ch].set(output);
+    // Invert output if needed
+    finalOut = invertOutput[ch].get() ? -output : output;
+} else {
+    // If PID is disabled, just use fast controller output (with optional inversion)
+    finalOut = invertOutput[ch].get() ? -fout : fout;
+    output = fout;
+    // Clear PID monitoring values
+    pid_error[ch].set(0);
+    pid_integral_sd[ch].set(0);
+    pid_derivative[ch].set(0);
+    pid_output[ch].set(0);
+}
+
+    // 5. Clamp to ±10V
+    finalOut = clamp10V(finalOut);
+    final_output[ch].set(finalOut);
+
+    // 6. Write to DAC
+    dacWrite(finalOut);
+}
+
+// --- ADC ISRs ---
+void adc1_isr_handler(void) {
+    unsigned long isr_start = micros();
+    processADCtoDAC(0, readADC1_from_ISR(), DAC1_write);
+    adc_isr_duration[0] = micros() - isr_start;
+}
+void adc2_isr_handler(void) {
+    unsigned long isr_start = micros();
+    processADCtoDAC(1, readADC2_from_ISR(), DAC2_write);
+    adc_isr_duration[1] = micros() - isr_start;
+}
+void adc3_isr_handler(void) {
+    unsigned long isr_start = micros();
+    processADCtoDAC(2, readADC3_from_ISR(), DAC3_write);
+    adc_isr_duration[2] = micros() - isr_start;
+}
+void adc4_isr_handler(void) {
+    unsigned long isr_start = micros();
+    processADCtoDAC(3, readADC4_from_ISR(), DAC4_write);
+    adc_isr_duration[3] = micros() - isr_start;
+}
+// --- Minimal command stubs (add more as needed) ---
+void hello(qCommand& qC, Stream& S) { S.println("Hello from qCommand!"); }
+void gain(qCommand& qC, Stream& S) {
+    if (qC.next() != NULL) {
+        float val = atof(qC.current());
+        FastGain[0].set(val); FastGain[1].set(val); FastGain[2].set(val); FastGain[3].set(val);
+        S.printf("FastGain set to: %f\n", val);
+    }
+}
+void UnknownCommand(const char* command, qCommand& qC, Stream& S) {
+    S.print("Unknown command: ");
+    S.println(command);
+}
+
+// --- SD Card File Functions (stubs to resolve linker errors) ---
+void writeFile() { /* TODO: Implement SD card write logic here */ }
+void readFile() { /* TODO: Implement SD card read logic here */ }
+void eraseFile() { /* TODO: Implement SD card erase logic here */ }
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+#ifdef Serial2
+    Serial2.begin(115200);
+#endif
+
+    // --- Assign SmartData variables for runtime tuning and monitoring ---
+    for (int ch = 0; ch < 4; ++ch) {
+        calcBiquadLPF(ch, cutoffHz[ch].get(), sampleRate[ch].get());
+        qC.assignVariable(("cutoffHz" + String(ch+1)).c_str(), &cutoffHz[ch]);
+        qC.assignVariable(("sampleRate" + String(ch+1)).c_str(), &sampleRate[ch]);
+        qC.assignVariable(("setpoint" + String(ch+1)).c_str(), &setpoint[ch]);
+        qC.assignVariable(("Kp" + String(ch+1)).c_str(), &Kp[ch]);
+        qC.assignVariable(("Ki" + String(ch+1)).c_str(), &Ki[ch]);
+        qC.assignVariable(("Kd" + String(ch+1)).c_str(), &Kd[ch]);
+        qC.assignVariable(("FastGain" + String(ch+1)).c_str(), &FastGain[ch]);
+        qC.assignVariable(("pidEnabled" + String(ch+1)).c_str(), &pidEnabled[ch]);
+        qC.assignVariable(("invertOutput" + String(ch+1)).c_str(), &invertOutput[ch]);
+        qC.assignVariable(("adc_voltage" + String(ch+1)).c_str(), &adc_voltage[ch], true);
+        qC.assignVariable(("filtered" + String(ch+1)).c_str(), &filtered[ch], true);
+        qC.assignVariable(("fast_error" + String(ch+1)).c_str(), &fast_error[ch], true);
+        qC.assignVariable(("fast_output" + String(ch+1)).c_str(), &fast_output[ch], true);
+        qC.assignVariable(("pid_error" + String(ch+1)).c_str(), &pid_error[ch], true);
+        qC.assignVariable(("pid_integral" + String(ch+1)).c_str(), &pid_integral_sd[ch], true);
+        qC.assignVariable(("pid_derivative" + String(ch+1)).c_str(), &pid_derivative[ch], true);
+        qC.assignVariable(("pid_output" + String(ch+1)).c_str(), &pid_output[ch], true);
+        qC.assignVariable(("final_output" + String(ch+1)).c_str(), &final_output[ch], true);
+    }
+
+    // --- qCommand setup ---
+    qC.setDefaultHandler(UnknownCommand);
+    qC.addCommand("HELLO", hello);
+    qC.addCommand("GAIN", gain);
+
+    // --- Configure ADCs to call ISRs ---
+    startADC(1, BIPOLAR_10V, adc1_isr_handler, sampleRate[0].get());
+    startADC(2, BIPOLAR_10V, adc2_isr_handler, sampleRate[1].get());
+    startADC(3, BIPOLAR_10V, adc3_isr_handler, sampleRate[2].get());
+    startADC(4, BIPOLAR_10V, adc4_isr_handler, sampleRate[3].get());
+
+    Serial.println("High-performance ADC-to-DAC pipeline initialized.");
+}
+
+void loop() {
+    qC.readSerial(Serial);
+#ifdef Serial2
+    qC.readSerial(Serial2);
+#endif
+    qC.readBinary();
+
+    // Example: print ISR durations periodically
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 1000) {
+        lastPrint = millis();
+        Serial.print("ADC ISR durations (us): ");
+        for (int i = 0; i < 4; ++i) {
+            Serial.print(adc_isr_duration[i]);
+            Serial.print(i < 3 ? ", " : "\n");
+        }
+    }
+    // All signal processing is in the ISRs!
+}
